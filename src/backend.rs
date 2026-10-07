@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use librespot_core::authentication::Credentials;
@@ -584,6 +585,11 @@ pub enum Command {
         selected:
             std::pin::Pin<Box<dyn std::future::Future<Output = Option<rfd::FileHandle>> + Send>>,
     },
+    /// Pick a folder to scan for local files.
+    ChooseLocalFolder {
+        selected:
+            std::pin::Pin<Box<dyn std::future::Future<Output = Option<rfd::FileHandle>> + Send>>,
+    },
     /// Start (or restart) the Web API sign-in in the browser.
     SignIn {
         request: u64,
@@ -710,6 +716,8 @@ pub enum Command {
         generation: u64,
     },
     StoreLikedSongsCache(crate::liked::Cache),
+    /// Rebuild the local-files index from the configured folders.
+    LocalFilesScan,
     /// Resolve the precise type of Web API singles through the streaming session.
     AlbumTypes(Vec<String>),
     /// Ask the streaming session which saved shows are audiobooks.
@@ -848,6 +856,14 @@ pub enum Event {
         generation: u64,
         cache: Option<crate::liked::Cache>,
     },
+    /// The local-files index finished or failed.
+    LocalFilesIndex {
+        result: Result<usize, String>,
+    },
+    /// A folder the listener picked to scan for local files.
+    LocalFolderChosen {
+        result: Option<std::path::PathBuf>,
+    },
 }
 
 /// The state of playback on this computer, independent of Web API sign-in.
@@ -900,6 +916,10 @@ pub struct Backend {
     album_type_requests: std::sync::Mutex<Vec<Vec<String>>>,
     #[cfg(test)]
     home_episode_requests: std::sync::Mutex<Vec<(Vec<String>, u64)>>,
+    #[cfg(test)]
+    reconnect_requests: std::sync::Mutex<u32>,
+    #[cfg(test)]
+    local_scan_requests: std::sync::Mutex<u32>,
 }
 
 impl Backend {
@@ -952,6 +972,7 @@ impl Backend {
                     if restore_sign_in {
                         worker.restore_session();
                     }
+                    worker.scan_local_files(false);
                     worker.run(command_rx).await;
                 });
                 // Give librespot's own threads a moment to release the audio device.
@@ -986,6 +1007,10 @@ impl Backend {
             album_type_requests: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             home_episode_requests: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            reconnect_requests: std::sync::Mutex::new(0),
+            #[cfg(test)]
+            local_scan_requests: std::sync::Mutex::new(0),
         }
     }
 
@@ -994,14 +1019,23 @@ impl Backend {
         &self.activity
     }
 
-    /// Stops Spotify-bound commands from leaving the process; artwork and
-    /// shutdown still work. Used by the demo mode and by headless tests.
+    /// Stops Spotify-bound commands from leaving the process; artwork,
+    /// shutdown and the disk-only local-file scan still work. Used by the
+    /// demo mode and by headless tests.
     #[cfg_attr(not(any(test, feature = "demo")), allow(dead_code))]
     pub fn set_offline(&mut self, offline: bool) {
         self.offline = offline;
     }
 
     pub fn send(&self, command: Command) {
+        #[cfg(test)]
+        if matches!(command, Command::Reconnect) {
+            *self.reconnect_requests.lock().unwrap() += 1;
+        }
+        #[cfg(test)]
+        if matches!(command, Command::LocalFilesScan) {
+            *self.local_scan_requests.lock().unwrap() += 1;
+        }
         if self.offline
             && !matches!(
                 command,
@@ -1011,6 +1045,9 @@ impl Backend {
                     | Command::InspectUpdate
                     | Command::DownloadUpdate { .. }
                     | Command::InstallUpdate { .. }
+                    // Disk work only; the interface tracks its ask as a
+                    // running scan and only the answering event clears it.
+                    | Command::LocalFilesScan
             )
         {
             return;
@@ -1031,6 +1068,18 @@ impl Backend {
         self.send(Command::ChoosePlaylistCover {
             id,
             request,
+            selected: Box::pin(selected),
+        });
+    }
+
+    pub fn choose_local_folder(&self) {
+        if self.offline {
+            return;
+        }
+        let selected = rfd::AsyncFileDialog::new()
+            .set_title("Choose a folder with local music")
+            .pick_folder();
+        self.send(Command::ChooseLocalFolder {
             selected: Box::pin(selected),
         });
     }
@@ -1188,6 +1237,16 @@ impl Backend {
     #[cfg(test)]
     pub(crate) fn take_player_commands(&self) -> Vec<PlayerCommand> {
         std::mem::take(&mut *self.player_commands.lock().unwrap())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reconnect_request_count(&self) -> u32 {
+        *self.reconnect_requests.lock().unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn local_scan_request_count(&self) -> u32 {
+        *self.local_scan_requests.lock().unwrap()
     }
 
     pub fn player(&self, command: PlayerCommand) {
@@ -1367,6 +1426,12 @@ struct Worker {
     resume: Option<PlaybackResume>,
     /// A pickup in flight: the load to repeat and how often it was tried.
     resume_verify: Option<(PlaybackResume, u8)>,
+    /// One folder scan at a time: startup, Settings, and the Local Files page
+    /// can each ask while another ask is still walking the disk. An ask that
+    /// arrives during a scan is remembered and repeated after, because it can
+    /// carry newer folder settings than the running scan.
+    local_scan_running: Arc<AtomicBool>,
+    local_scan_pending: Arc<AtomicBool>,
 }
 
 impl Worker {
@@ -1424,6 +1489,8 @@ impl Worker {
             reconnects: Vec::new(),
             resume: None,
             resume_verify: None,
+            local_scan_running: Arc::new(AtomicBool::new(false)),
+            local_scan_pending: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1662,6 +1729,15 @@ impl Worker {
                             request,
                             result,
                         });
+                        waker.wake();
+                    });
+                }
+                Command::ChooseLocalFolder { selected } => {
+                    let events = self.events.clone();
+                    let waker = self.waker.clone();
+                    tokio::spawn(async move {
+                        let result = selected.await.map(|file| file.path().to_path_buf());
+                        let _ = events.send(Event::LocalFolderChosen { result });
                         waker.wake();
                     });
                 }
@@ -1973,6 +2049,7 @@ impl Worker {
                         }
                     }
                 }
+                Command::LocalFilesScan => self.scan_local_files(true),
                 Command::AlbumTypes(uris) => self.fetch_album_types(uris),
                 Command::AudiobookShows(uris) => {
                     self.audiobook_lookup.extend(uris);
@@ -3160,6 +3237,91 @@ impl Worker {
                 result,
             });
             waker.wake();
+        });
+    }
+
+    /// Scans, or requeues on a running scan. `report_noop` answers the
+    /// nothing-to-do case, for callers that show a scanning state (the
+    /// startup scan has none).
+    fn scan_local_files(&self, report_noop: bool) {
+        let settings = crate::settings::Settings::load(&self.dirs.settings_file());
+        let index_path = crate::localfiles::index_path(&self.dirs);
+        if self
+            .local_scan_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            // The running check comes before the nothing-to-do case: a
+            // scan started while its last folder was removed may still be
+            // writing that folder's index, so the ask must repeat after it.
+            self.local_scan_pending.store(true, Ordering::SeqCst);
+            return;
+        }
+        if settings.local_folders.is_empty() && !index_path.exists() {
+            // Nothing configured and nothing to clean up: don't create an
+            // index file for a feature in use by nobody.
+            self.local_scan_running.store(false, Ordering::SeqCst);
+            if report_noop {
+                let _ = self.events.send(Event::LocalFilesIndex { result: Ok(0) });
+                self.waker.wake();
+            }
+            return;
+        }
+        let folders: Vec<std::path::PathBuf> = settings
+            .local_folders
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect();
+        let events = self.events.clone();
+        let waker = self.waker.clone();
+        let running = Arc::clone(&self.local_scan_running);
+        let pending = Arc::clone(&self.local_scan_pending);
+        let commands = self.commands.clone();
+        tokio::task::spawn_blocking(move || {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let cancel = Arc::new(AtomicBool::new(false));
+            // A panic in the walk (a symphonia probe bug on an exotic file)
+            // must still reset the running flag and report a failed scan, or
+            // every later rescan request is silently dropped.
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::localfiles::scan(&folders, &index_path, tx, cancel);
+            }))
+            .is_err();
+            let mut result = Ok(0);
+            let mut cancelled = false;
+            for event in rx {
+                match event {
+                    crate::localfiles::ScanEvent::Finished { indexed, .. } => {
+                        result = Ok(indexed);
+                    }
+                    crate::localfiles::ScanEvent::Failed(error) => {
+                        result = Err(error);
+                        break;
+                    }
+                    crate::localfiles::ScanEvent::Cancelled => {
+                        cancelled = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            if panicked {
+                cancelled = false;
+                result = Err("Local file scan stopped unexpectedly".to_string());
+            }
+            running.store(false, Ordering::SeqCst);
+            let rescan_queued = pending.swap(false, Ordering::SeqCst);
+            // A cancelled scan left the previous index untouched; there is no
+            // new result to announce. A queued rescan carries newer folder
+            // settings, so its own result announces the state instead of this
+            // one's stale one.
+            if !cancelled && !rescan_queued {
+                let _ = events.send(Event::LocalFilesIndex { result });
+                waker.wake();
+            }
+            if rescan_queued {
+                let _ = commands.send(Command::LocalFilesScan);
+            }
         });
     }
 
@@ -4460,6 +4622,51 @@ fn write_playlist_manifest(
 }
 
 #[cfg(test)]
+fn worker(
+    name: &str,
+) -> (
+    tokio::runtime::Runtime,
+    Worker,
+    std::sync::mpsc::Receiver<Event>,
+) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let root = std::env::temp_dir().join(format!("spotifast-auth-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let dirs = AppDirs {
+        config: root.join("config"),
+        state: root.join("state"),
+        cache: root.join("cache"),
+    };
+    let settings = crate::settings::Settings::default();
+    let config = crate::app::engine_config(
+        &dirs,
+        &settings,
+        ProxyConfig::Off,
+        crate::vis::AudioTap::new(),
+        crate::eq::shared(),
+    );
+    let http = Http::new(reqwest::Client::new());
+    let art = ArtLoader::new(http.clone(), runtime.handle().clone(), dirs.art_cache_dir());
+    let (sender, events) = std::sync::mpsc::channel();
+    let (commands, _) = mpsc::unbounded_channel();
+    let worker = Worker::new(
+        dirs,
+        config,
+        Some("personal".into()),
+        http,
+        art,
+        Arc::new(NetActivity::default()),
+        sender,
+        commands,
+        Waker::default(),
+    );
+    (runtime, worker, events)
+}
+
+#[cfg(test)]
 mod album_type_lookup_tests {
     use super::AlbumTypeLookup;
 
@@ -5435,51 +5642,6 @@ mod authorization_tests {
         assert!(events.try_iter().next().is_none());
     }
 
-    fn worker(
-        name: &str,
-    ) -> (
-        tokio::runtime::Runtime,
-        Worker,
-        std::sync::mpsc::Receiver<Event>,
-    ) {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let root =
-            std::env::temp_dir().join(format!("spotifast-auth-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let dirs = AppDirs {
-            config: root.join("config"),
-            state: root.join("state"),
-            cache: root.join("cache"),
-        };
-        let settings = crate::settings::Settings::default();
-        let config = crate::app::engine_config(
-            &dirs,
-            &settings,
-            ProxyConfig::Off,
-            crate::vis::AudioTap::new(),
-            crate::eq::shared(),
-        );
-        let http = Http::new(reqwest::Client::new());
-        let art = ArtLoader::new(http.clone(), runtime.handle().clone(), dirs.art_cache_dir());
-        let (sender, events) = std::sync::mpsc::channel();
-        let (commands, _) = mpsc::unbounded_channel();
-        let worker = Worker::new(
-            dirs,
-            config,
-            Some("personal".into()),
-            http,
-            art,
-            Arc::new(NetActivity::default()),
-            sender,
-            commands,
-            Waker::default(),
-        );
-        (runtime, worker, events)
-    }
-
     #[test]
     fn cover_confirmation_checks_the_largest_image_without_spotify_credentials() {
         use std::io::{Read, Write};
@@ -6237,5 +6399,78 @@ mod tests {
         assert!(pending);
         assert!(!defer_engine_replace(false, &mut pending));
         assert!(pending, "finishing the attempt owns clearing the request");
+    }
+
+    #[test]
+    fn a_reported_noop_scan_still_answers() {
+        // Nothing configured and no index on disk: the request is a no-op.
+        let (_runtime, worker, events) = worker("noop-scan");
+        assert!(events.try_recv().is_err());
+        worker.scan_local_files(false);
+        assert!(
+            events.try_recv().is_err(),
+            "the startup scan has no interface state to clear"
+        );
+        worker.scan_local_files(true);
+        match events.recv_timeout(Duration::from_secs(2)) {
+            Ok(Event::LocalFilesIndex { result: Ok(0) }) => {}
+            Ok(_) => panic!("a reported no-op scan must answer with a zero-index event"),
+            Err(error) => panic!("a reported no-op scan must still answer: {error}"),
+        }
+        assert!(
+            !worker.local_scan_running.load(Ordering::SeqCst),
+            "the no-op releases the slot for the next request"
+        );
+    }
+
+    #[test]
+    fn a_noop_scan_during_a_running_scan_is_still_repeated() {
+        let (_runtime, worker, events) = worker("noop-scan-pending");
+        worker.local_scan_running.store(true, Ordering::SeqCst);
+        worker.scan_local_files(true);
+        assert!(
+            worker.local_scan_pending.load(Ordering::SeqCst),
+            "a scan started while its last folder left may still write the \
+             old index, so even a no-op ask repeats after it"
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "nothing to report to: the running scan owns the next event"
+        );
+    }
+
+    #[test]
+    fn a_queued_rescan_suppresses_the_outdated_answer() {
+        let (runtime, worker, events) = worker("rescan-suppresses");
+        let _entered = runtime.enter();
+        // Folders configured, so this walk is a real scan, not the no-op.
+        let settings = crate::settings::Settings {
+            local_folders: vec!["folder-that-is-gone-now".into()],
+            ..Default::default()
+        };
+        let settings_file = worker.dirs.settings_file();
+        let _ = std::fs::create_dir_all(settings_file.parent().unwrap());
+        settings.save(&settings_file);
+        // As if a folder change asked while this scan was still walking.
+        worker.local_scan_pending.store(true, Ordering::SeqCst);
+        worker.scan_local_files(true);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while worker.local_scan_running.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !worker.local_scan_running.load(Ordering::SeqCst),
+            "the walk finished"
+        );
+        assert!(
+            !worker.local_scan_pending.load(Ordering::SeqCst),
+            "the queued rescan was consumed once"
+        );
+        assert!(
+            events
+                .try_iter()
+                .all(|event| !matches!(event, Event::LocalFilesIndex { .. })),
+            "the rescan carries newer folders, so its own result announces the state"
+        );
     }
 }

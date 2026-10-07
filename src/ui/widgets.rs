@@ -1102,6 +1102,28 @@ pub(crate) fn row_playable(item: &PlayableItem) -> bool {
             if track.is_local || track.is_playable == Some(false))
 }
 
+/// Whether a local-file row can start playback on the current target: only
+/// this computer's player reaches the files, and only ones the scanned index
+/// knows: a saved row whose file was never picked up would just fail to load.
+/// Before the first scan the index is unknown, and unknown stays playable,
+/// matching how remote availability does. An undecided target (the engine is
+/// connecting) counts as this computer, matching how such a request waits for
+/// the engine.
+pub(crate) fn local_playable_here(app: &App, item: &PlayableItem) -> bool {
+    item.uri().starts_with("spotify:local:")
+        && !app.settings.local_folders.is_empty()
+        && !matches!(app.target(), crate::app::Target::Remote(Some(_)))
+        && app
+            .local_index
+            .as_deref()
+            .is_none_or(|index| index.contains_uri(item.uri()))
+}
+
+/// Whether a row can start playback where playback would go now.
+pub(crate) fn row_playable_here(app: &App, item: &PlayableItem) -> bool {
+    row_playable(item) || local_playable_here(app, item)
+}
+
 /// Describes one row of a track table.
 pub struct TrackRow<'a> {
     pub index: usize,
@@ -1257,7 +1279,7 @@ fn track_row_contents(
     let width = ui.available_width();
     let (rect, response) = ui.allocate_exact_size(vec2(width, row_height), Sense::click_and_drag());
     let rect = rect.translate(vec2(0.0, row.shift));
-    let unavailable = !row_playable(row.item);
+    let unavailable = !row_playable_here(app, row.item);
     response.widget_info(|| {
         egui::WidgetInfo::selected(
             egui::WidgetType::Button,

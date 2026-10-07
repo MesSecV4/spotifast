@@ -39,6 +39,8 @@ impl Entry {
     fn ordering_key(&self) -> &str {
         if self.liked {
             LIKED_SONGS_KEY
+        } else if self.page == Page::LocalFiles {
+            crate::settings::LOCAL_FILES_KEY
         } else {
             &self.uri
         }
@@ -321,6 +323,37 @@ fn liked_entry(app: &App) -> Entry {
         depth: 0,
         added_at: None,
     }
+}
+
+/// The Local Files row, present only once folders are set in Settings. It
+/// has no Spotify URI, so the play affordances that need one stay off.
+fn local_files_entry(app: &App) -> Option<Entry> {
+    if app.settings.local_folders.is_empty() {
+        return None;
+    }
+    let count = app
+        .local_files_count
+        .map(|count| u32::try_from(count).unwrap_or(u32::MAX));
+    Some(Entry {
+        image: None,
+        grid_image: None,
+        name: gettext(app.locale, "Local Files").into_owned(),
+        subtitle: count.map_or_else(
+            || gettext(app.locale, "Local Files").into_owned(),
+            |count| app.locale.song_count(count),
+        ),
+        grid_subtitle: count.map_or_else(String::new, |count| app.locale.song_count(count)),
+        page: Page::LocalFiles,
+        uri: String::new(),
+        round: false,
+        liked: false,
+        owned: false,
+        editable: false,
+        playlist_index: None,
+        folder: None,
+        depth: 0,
+        added_at: None,
+    })
 }
 
 pub(crate) fn selected_sort(app: &App, shelf: Filter) -> LibrarySort {
@@ -1035,6 +1068,11 @@ fn contents(app: &mut App, ui: &mut egui::Ui, grid_art: Option<Rect>) {
             let liked = liked_entry(app);
             if needle.is_empty() || liked.name.to_lowercase().contains(&needle) {
                 entries.push(liked);
+            }
+            if let Some(local) = local_files_entry(app)
+                && (needle.is_empty() || local.name.to_lowercase().contains(&needle))
+            {
+                entries.push(local);
             }
             let show_folders = sort == LibrarySort::Spotify && needle.is_empty();
             if show_folders {
@@ -1929,7 +1967,11 @@ fn drop_playlist_row(app: &mut App, entries: &[Entry], pinned_rows: usize, slot:
                 })
             } else {
                 let held = entry.ordering_key();
-                (!held.is_empty() && held != key).then_some(held)
+                // Rows the stored order does not carry (Local Files) cannot
+                // anchor: a drop before one lands just before the next row
+                // the order does carry, never at its tail.
+                (!held.is_empty() && held != key && order.iter().any(|known| known == held))
+                    .then_some(held)
             }
         })
         .map(str::to_string);
@@ -2355,6 +2397,31 @@ mod ordering_tests {
         apply_actions(&mut app);
         assert_eq!(app.settings.library_pins(), [LIKED_SONGS_KEY]);
         assert_eq!(app.settings.sidebar_order, ["b", "a", "c", "d"].map(uri));
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn dropping_before_the_local_files_row_keeps_the_drop_position() {
+        let mut app = app("local-files-drop");
+        app.settings.local_folders = vec!["music".into()];
+        app.settings
+            .library_sort
+            .insert(Filter::Playlists, LibrarySort::Name);
+        let mut entries = rows(&app);
+        entries.extend(local_files_entry(&app));
+        order_entries(&app, Filter::Playlists, LibrarySort::Name, &mut entries);
+        // Name sort: Alpha(b), alpha(c), Beta(d), Local Files, Zebra(a).
+        let local_at = entries
+            .iter()
+            .position(|entry| entry.page == Page::LocalFiles)
+            .expect("the Local Files row is listed");
+        assert_eq!(local_at, 3);
+        // Dropping Alpha above Local Files cannot anchor to the row: the
+        // stored order does not carry it. The playlist lands just before the
+        // row the order knows next, not at the tail.
+        drop_playlist_row(&mut app, &entries, 0, local_at, &uri("b"));
+        apply_actions(&mut app);
+        assert_eq!(app.settings.sidebar_order, ["c", "d", "b", "a"].map(uri));
         app.backend.shutdown();
     }
 
